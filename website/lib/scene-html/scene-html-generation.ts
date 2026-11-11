@@ -494,7 +494,7 @@ export class SceneHtmlGenerationService {
     const sceneLabel = input.sceneId || "unknown scene";
     try {
       const rawHtml = await this.createHtmlGemini().generateText(this.buildDirectHtmlPrompt(input), {
-        model: process.env.GEMINI_HTML_MODEL || process.env.GEMINI_MODEL || "gemini-3.8-flash",
+        model: process.env.GEMINI_HTML_FALLBACK_MODEL || process.env.GEMINI_MODEL || "gemini-3.8-flash",
         temperature: 0.7,
         topP: 0.92,
         maxAttempts: 2,
