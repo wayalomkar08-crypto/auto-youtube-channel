@@ -1,0 +1,898 @@
+import { API_BASE_URL } from '../config';
+
+export type JobResult = 'success' | 'failure' | 'skipped' | 'cancelled' | 'running' | null;
+
+export type ShortResult = {
+    shortIndex: number;
+    shortId: string;
+    youtubeId: string;
+    videoUrl?: string;
+    scheduledPublishTime?: string;
+    rank?: number;
+    caption?: string;
+    status?: 'success' | 'failure' | 'running';
+    error?: string;
+};
+
+export type PipelineStatus = {
+    overallStatus: 'success' | 'failure' | 'running';
+    ranAt: string; // ISO timestamp
+    runId?: string | number;       // GitHub Actions workflow run ID
+    videoId: string;
+    videoTitle: string;
+    description?: string;          // YouTube description from script
+    youtubeId?: string;            // main video YouTube ID
+    scheduledPublishTime?: string; // ISO scheduled publication time
+    videoUrl?: string;             // assembled video Cloudinary URL
+    thumbnailUrl?: string;         // thumbnail Cloudinary URL
+    selectedThumbnailUrl?: string; // active thumbnail URL
+    thumbnailVariations?: (string | { url: string; archetype?: string })[]; // all generated thumbnail variations
+    abTesting?: {
+        enabled: boolean;
+        candidates?: string[];
+        updatedAt?: string;
+    } | null;
+    sceneUrls?: string[];          // per-scene rendered video URLs
+    voiceoverUrls?: string[];      // per-scene audio URLs
+    sceneNarrations?: string[];    // narration text per scene
+    ideasAdded?: string[];         // ideas added to queue this run
+    queuedIdeas?: Array<{
+        topic: string;
+        isSeries?: boolean;
+        seriesTitle?: string | null;
+        learningObjective?: string | null;
+    }>;                            // candidate ideas currently queued in video:ideas
+    shortHooks?: string[];         // hook text per short
+    shortCaptions?: string[];      // paste-ready Instagram Reel captions
+    shorts?: ShortResult[];        // per-short YouTube + video URLs
+    scriptData?: unknown;          // full raw script object from generate-script
+    jobs: {
+        populateIdeas: JobResult;
+        generateScript: JobResult;
+        renderScenes: JobResult;
+        generateVoiceover: JobResult;
+        assembleLongForm: JobResult;
+        generateThumbnail: JobResult;
+        uploadYoutube: JobResult;
+        shortsProcessing: JobResult;
+    };
+};
+
+export type PipelineStatusResponse = {
+    ok: boolean;
+    status?: PipelineStatus;
+    error?: string;
+};
+
+export type SavePushTokenResponse = {
+    ok: boolean;
+    error?: string;
+};
+
+export type RerunFailedJobsResponse = {
+    ok: boolean;
+    message?: string;
+    runId?: string | number;
+    error?: string;
+};
+
+// Helper function for fetch with timeout and better error handling
+const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeout = 10000) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal,
+        });
+        clearTimeout(id);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return response;
+    } catch (error: any) {
+        clearTimeout(id);
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeout}ms`);
+        }
+        throw error;
+    }
+};
+
+// Ideas Queue API Types
+export type IdeasQueue = {
+    ideas: string[];
+    count: number;
+};
+
+export type IdeasQueueResponse = {
+    ok: boolean;
+    ideas: string[];
+    count: number;
+    error?: string;
+};
+
+// Shorts Publish Time API Types
+export type ShortsPublishTimeResponse = {
+    ok: boolean;
+    time?: string;
+    error?: string;
+};
+
+// Retention Stat Type
+export type RetentionStat = {
+    estimatedRetention: number;
+    sampleCount: number;
+    hasHistory?: boolean;
+    isCalibrating?: boolean;
+};
+
+// Schedule Times API Types
+export type ScheduleTimesResponse = {
+    ok: boolean;
+    shortsTimes?: string[];
+    longFormTime?: string;
+    retentionStats?: Record<string, RetentionStat>;
+    error?: string;
+};
+
+// Settings API Types
+export type CustomArchetype = {
+    id: string;
+    label: string;
+    promptHint?: string;
+};
+
+export type SettingsResponse = {
+    ok: boolean;
+    voiceoverProvider?: 'gemini' | 'f5';
+    sceneRenderMethod?: 'code' | 'ai';
+    thumbnailPrimaryArchetype?: string;
+    thumbnailVariationsEnabled?: boolean;
+    thumbnailActiveArchetypes?: string[];
+    thumbnailCustomArchetypes?: CustomArchetype[];
+    error?: string;
+};
+
+// Ideas Queue API
+export const ideasApi = {
+    // Get all ideas
+    getIdeas: async (): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Fetching ideas from:', `${API_BASE_URL}/api/ideas-queue`);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`);
+            const data = await response.json();
+            console.log('[API] Ideas fetched successfully:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching ideas:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Add a new idea
+    addIdea: async (idea: string, position: 'top' | 'bottom' = 'bottom'): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Adding idea:', idea, 'position:', position);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'add', idea, position }),
+            });
+            const data = await response.json();
+            console.log('[API] Idea added successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error adding idea:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Edit an existing idea
+    editIdea: async (index: number, idea: string): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Editing idea at index:', index);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'edit', index, idea }),
+            });
+            const data = await response.json();
+            console.log('[API] Idea edited successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error editing idea:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Remove an idea
+    removeIdea: async (index: number): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Removing idea at index:', index);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'remove', index }),
+            });
+            const data = await response.json();
+            console.log('[API] Idea removed successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error removing idea:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Move an idea
+    moveIdea: async (index: number, newIndex: number): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Moving idea from', index, 'to', newIndex);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'move', index, newIndex }),
+            });
+            const data = await response.json();
+            console.log('[API] Idea moved successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error moving idea:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Clear all ideas
+    clearIdeas: async (): Promise<IdeasQueueResponse> => {
+        try {
+            console.log('[API] Clearing all ideas');
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/ideas-queue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'clear' }),
+            });
+            const data = await response.json();
+            console.log('[API] Ideas cleared successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error clearing ideas:', error.message || error);
+            return {
+                ok: false,
+                ideas: [],
+                count: 0,
+                error: error.message || String(error)
+            };
+        }
+    },
+};
+
+// Shorts Publish Time API
+export const shortsApi = {
+    // Get current publish time
+    getPublishTime: async (): Promise<ShortsPublishTimeResponse> => {
+        try {
+            console.log('[API] Fetching publish time from:', `${API_BASE_URL}/api/shorts-publish-time`);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/shorts-publish-time`);
+            const data = await response.json();
+            console.log('[API] Publish time fetched successfully:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching publish time:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Update publish time
+    updatePublishTime: async (time: string): Promise<ShortsPublishTimeResponse> => {
+        try {
+            console.log('[API] Updating publish time to:', time);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/shorts-publish-time`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time }),
+            });
+            const data = await response.json();
+            console.log('[API] Publish time updated successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating publish time:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+};
+
+// Schedule Times API (New unified API for both shorts and long-form)
+export const scheduleTimesApi = {
+    // Get all schedule times (shorts ranked times + long-form time)
+    getScheduleTimes: async (): Promise<ScheduleTimesResponse> => {
+        try {
+            console.log('[API] Fetching schedule times from:', `${API_BASE_URL}/api/schedule-times`);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/schedule-times`);
+            const data = await response.json();
+            console.log('[API] Schedule times fetched successfully:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching schedule times:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Update shorts times (array of 5 ranked times)
+    updateShortsTimes: async (shortsTimes: string[]): Promise<ScheduleTimesResponse> => {
+        try {
+            console.log('[API] Updating shorts times:', shortsTimes);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/schedule-times`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ shortsTimes }),
+            });
+            const data = await response.json();
+            console.log('[API] Shorts times updated successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating shorts times:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Update long-form time
+    updateLongFormTime: async (longFormTime: string): Promise<ScheduleTimesResponse> => {
+        try {
+            console.log('[API] Updating long-form time:', longFormTime);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/schedule-times`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ longFormTime }),
+            });
+            const data = await response.json();
+            console.log('[API] Long-form time updated successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating long-form time:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Update both shorts and long-form times
+    updateAllScheduleTimes: async (shortsTimes: string[], longFormTime: string): Promise<ScheduleTimesResponse> => {
+        try {
+            console.log('[API] Updating all schedule times');
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/schedule-times`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ shortsTimes, longFormTime }),
+            });
+            const data = await response.json();
+            console.log('[API] All schedule times updated successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating all schedule times:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+};
+
+// Pipeline Status API
+export const pipelineApi = {
+    // Save Expo push token so server can send notifications
+    savePushToken: async (token: string): Promise<SavePushTokenResponse> => {
+        try {
+            console.log('[API] Saving push token');
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/push-token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token }),
+            });
+            const data = await response.json();
+            console.log('[API] Push token saved successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error saving push token:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    // Trigger a live test notification (success or failure)
+    triggerTestNotification: async (type: 'success' | 'failure'): Promise<{ ok: boolean; error?: string }> => {
+        try {
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/test-notification`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error triggering test notification:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    // Get latest pipeline run status
+    getPipelineStatus: async (): Promise<PipelineStatusResponse> => {
+        try {
+            const url = `${API_BASE_URL}/api/pipeline-status?t=${Date.now()}`;
+            console.log('[API] Fetching pipeline status from:', url);
+            const response = await fetchWithTimeout(url, {
+                headers: { 'Cache-Control': 'no-cache, no-store', Pragma: 'no-cache' },
+            }, 15000);
+            const data = await response.json();
+            console.log('[API] Pipeline status fetched successfully');
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching pipeline status:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    // Rerun failed jobs for the latest or specific workflow run
+    rerunFailedJobs: async (runId?: string | number): Promise<RerunFailedJobsResponse> => {
+        try {
+            console.log('[API] Triggering rerun for failed jobs, runId:', runId);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/rerun-failed-jobs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ runId }),
+            }, 20000);
+            const data = await response.json();
+            console.log('[API] Rerun response:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error triggering rerun:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+};
+
+// Settings API
+export const settingsApi = {
+    // Get current configuration settings
+    getSettings: async (): Promise<SettingsResponse> => {
+        try {
+            console.log('[API] Fetching settings from:', `${API_BASE_URL}/api/settings`);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/settings`);
+            const data = await response.json();
+            console.log('[API] Settings fetched successfully:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching settings:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+
+    // Update settings
+    updateSettings: async (
+        arg1: {
+            voiceoverProvider?: 'gemini' | 'f5';
+            sceneRenderMethod?: 'code' | 'ai';
+            thumbnailPrimaryArchetype?: string;
+            thumbnailVariationsEnabled?: boolean;
+            thumbnailActiveArchetypes?: string[];
+            thumbnailCustomArchetypes?: CustomArchetype[];
+        } | 'gemini' | 'f5',
+        arg2?: 'code' | 'ai'
+    ): Promise<SettingsResponse> => {
+        try {
+            const payload = typeof arg1 === 'object'
+                ? arg1
+                : { voiceoverProvider: arg1, sceneRenderMethod: arg2 };
+
+            console.log('[API] Updating settings with:', payload);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json();
+            console.log('[API] Settings updated successfully:', data);
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating settings:', error.message || error);
+            return {
+                ok: false,
+                error: error.message || String(error)
+            };
+        }
+    },
+};
+
+// Thumbnail & A/B Testing API
+export const thumbnailApi = {
+    setActiveThumbnail: async (videoId: string, thumbnailUrl: string): Promise<{ ok: boolean; message?: string; error?: string }> => {
+        try {
+            console.log('[API] Setting active thumbnail:', { videoId, thumbnailUrl });
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/thumbnail`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'set-active', videoId, thumbnailUrl }),
+            }, 25000);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error setting active thumbnail:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    setAbTest: async (videoId: string, enabled: boolean, candidates: string[]): Promise<{ ok: boolean; message?: string; error?: string }> => {
+        try {
+            console.log('[API] Setting thumbnail A/B test:', { videoId, enabled, candidates });
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/thumbnail`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'set-ab-test', videoId, enabled, candidates }),
+            }, 15000);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error configuring A/B test:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+};
+
+// Series Management API Types
+export type SeriesQueueItem = {
+    episodeId: string;
+    topic: string;
+    learningObjective: string;
+    difficulty: "beginner" | "intermediate" | "advanced";
+    estimatedDuration: string;
+    prerequisites: string[];
+    status?: "pending" | "in_progress";
+};
+
+export type SeriesState = {
+    id: string;
+    title: string;
+    learningGoal: string;
+    status: "active" | "paused" | "completed";
+    version: number;
+    priority: number;
+    uploadCount: number;
+    lastUploadTimestamp: string;
+    learningQueue: SeriesQueueItem[];
+    history: any[];
+    hasQueuedEpisode?: boolean;
+    queuedEpisode?: {
+        episodeId?: string;
+        topic?: string;
+    } | null;
+};
+
+export type SeriesResponse = {
+    ok: boolean;
+    series?: SeriesState | SeriesState[];
+    result?: any;
+    error?: string;
+};
+
+// Series API
+export const seriesApi = {
+    getSeries: async (): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Fetching series from:', `${API_BASE_URL}/api/series`);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching series:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    createSeries: async (title: string, learningGoal: string): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Creating series:', title);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'create', title, learningGoal }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error creating series:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    pushEpisodeToQueue: async (id: string, episodeId?: string): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Pushing episode to queue for series:', id, episodeId);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'pushToQueue', id, episodeId }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error pushing episode to queue:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    updateSeriesStatus: async (id: string, status: 'active' | 'paused' | 'completed'): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Updating series status:', id, status);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'updateStatus', id, status }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating series status:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    reactivateSeries: async (id: string): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Reactivating series:', id);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'reactivate', id }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error reactivating series:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    deleteSeries: async (id: string): Promise<SeriesResponse> => {
+        try {
+            console.log('[API] Deleting series:', id);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/series`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'delete', id }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error deleting series:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    }
+};
+
+// Auto Comment Reply Types
+export type CommentReplySettings = {
+    enabled: boolean;
+    dryRun: boolean;
+    maxRepliesPerRun: number;
+    tone: 'friendly' | 'professional' | 'technical' | 'enthusiastic';
+    customInstructions?: string;
+    replyToQuestionsOnly?: boolean;
+};
+
+export type ReplyHistoryEntry = {
+    id: string;
+    threadId: string;
+    commentId: string;
+    videoId: string;
+    videoTitle: string;
+    authorName: string;
+    commentText: string;
+    replyText: string;
+    category: string;
+    sentiment: string;
+    status: 'posted' | 'dry_run' | 'skipped' | 'failed';
+    error?: string;
+    timestamp: string;
+};
+
+export type CommentsHistoryResponse = {
+    ok: boolean;
+    settings?: CommentReplySettings;
+    stats?: {
+        totalLiveReplies: number;
+        totalDryRunReplies: number;
+        totalFailed: number;
+    };
+    history?: ReplyHistoryEntry[];
+    error?: string;
+};
+
+export type CommentsSettingsResponse = {
+    ok: boolean;
+    settings?: CommentReplySettings;
+    error?: string;
+};
+
+export type CommentsProcessResponse = {
+    ok: boolean;
+    result?: {
+        success: boolean;
+        totalChecked: number;
+        repliesSent: number;
+        repliesDryRun: number;
+        repliesSkipped: number;
+        errors: string[];
+    };
+    error?: string;
+};
+
+export type CommentsDispatchResponse = {
+    success: boolean;
+    message?: string;
+    error?: string;
+};
+
+// Auto Comment Reply API
+export const commentsApi = {
+    getHistory: async (limit: number = 30): Promise<CommentsHistoryResponse> => {
+        try {
+            console.log('[API] Fetching comments history');
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/history?limit=${limit}`);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching comments history:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    getSettings: async (): Promise<CommentsSettingsResponse> => {
+        try {
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/settings`);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error fetching comments settings:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    updateSettings: async (settings: Partial<CommentReplySettings>): Promise<CommentsSettingsResponse> => {
+        try {
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating comments settings:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    processNow: async (options?: { dryRun?: boolean; maxReplies?: number }): Promise<CommentsProcessResponse> => {
+        try {
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/process`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...options, force: true }),
+            }, 60000); // 60s timeout for full AI batch
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error processing comments:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    dispatchGitHub: async (options?: { dryRun?: boolean; maxReplies?: number }): Promise<CommentsDispatchResponse> => {
+        try {
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/cron/auto-comment-reply`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...options, force: true }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error dispatching comments workflow:', error.message || error);
+            return { success: false, error: error.message || String(error) };
+        }
+    },
+
+    postLiveReply: async (params: {
+        threadId: string;
+        commentId?: string;
+        replyText: string;
+        historyId?: string;
+    }): Promise<{ ok: boolean; message?: string; error?: string }> => {
+        try {
+            console.log('[API] Posting live reply for thread:', params.threadId);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/post-reply`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+            }, 25000);
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error posting live reply:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    updateReplyText: async (id: string, replyText: string): Promise<{ ok: boolean; error?: string; message?: string }> => {
+        try {
+            console.log('[API] Updating reply text for item:', id);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/history`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, replyText }),
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error updating reply text:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+
+    deleteHistoryItem: async (id: string): Promise<{ ok: boolean; error?: string; message?: string }> => {
+        try {
+            console.log('[API] Deleting comment history item:', id);
+            const response = await fetchWithTimeout(`${API_BASE_URL}/api/comments/history?id=${encodeURIComponent(id)}`, {
+                method: 'DELETE',
+            });
+            const data = await response.json();
+            return data;
+        } catch (error: any) {
+            console.error('[API] Error deleting comment history item:', error.message || error);
+            return { ok: false, error: error.message || String(error) };
+        }
+    },
+};
+

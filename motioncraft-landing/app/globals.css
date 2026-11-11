@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+:root {
+  --bg-obsidian: #110e08;
+  --bg-surface: #16130d;
+  --bg-card: #191610;
+  --bg-elevated: #221e17;
+  --bg-recessed: #0c0a07;
+
+  --border-stone: #2e281f;
+  --border-hairline: rgba(200, 178, 155, 0.12);
+  --border-light: #3f3931;
+
+  --sandstone-primary: #c8b29b;
+  --sandstone-light: #d8c4ad;
+  --sandstone-dark: #b59e85;
+  --sandstone-tint: rgba(200, 178, 155, 0.08);
+
+  --text-linen: #f7f3ee;
+  --text-dim: #eae1d7;
+  --text-muted: #9c958c;
+  --text-whisper: #736d64;
+
+  --status-success: #4ade80;
+  --status-running: #fbbf24;
+  --status-failed: #f87171;
+  --youtube-red: #ef4444;
+
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg-obsidian);
+  color: var(--text-linen);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+/* Subtle architectural hairline grid background */
+.architectural-grid {
+  background-image: 
+    linear-gradient(to right, rgba(200, 178, 155, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(200, 178, 155, 0.04) 1px, transparent 1px);
+  background-size: 56px 56px;
+}
+
+/* Luxury card container */
+.studio-card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-stone);
+  border-radius: 16px;
+  position: relative;
+  transition: border-color 0.25s ease, transform 0.25s ease;
+}
+
+.studio-card:hover {
+  border-color: rgba(200, 178, 155, 0.35);
+}
+
+/* Subtle hairline badge */
+.studio-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  background: rgba(200, 178, 155, 0.08);
+  border: 1px solid rgba(200, 178, 155, 0.2);
+  color: var(--sandstone-light);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Focus styles for accessible keyboard navigation */
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--sandstone-primary);
+  outline-offset: 2px;
+}
+
+/* Ensure all buttons, links, and interactive elements give cursor: pointer on hover */
+button,
+a,
+[role="button"],
+input[type="button"],
+input[type="submit"],
+.studio-button {
+  cursor: pointer;
+}
+
+button:disabled,
+[role="button"][aria-disabled="true"],
+input[type="submit"]:disabled {
+  cursor: not-allowed;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #110e08;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2e281f;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3931;
+}

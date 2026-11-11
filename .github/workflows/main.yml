@@ -1,0 +1,741 @@
+name: Daily Video Generation Pipeline
+
+on:
+  # push:
+  #   branches: [add-github-actions]  # Temporary: for testing on feature branch
+  workflow_dispatch:
+    inputs:
+      video_idea:
+        description: 'Custom video idea (optional - will use random from list if not provided)'
+        required: false
+        type: string
+  # schedule:
+  #   - cron: '23 0 * * *'  # Run daily at 0:23 AM UTC, 05:53 AM IST - adjust as needed
+
+jobs:
+  # Resolve dynamic pipeline settings once. Redis is authoritative; repository
+  # variables are used only when Redis is unavailable or has no valid value.
+  pipeline-settings:
+    name: Resolve Pipeline Settings
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      voiceover_provider: ${{ steps.settings.outputs.voiceover_provider }}
+      scene_render_method: ${{ steps.settings.outputs.scene_render_method }}
+      settings_source: ${{ steps.settings.outputs.settings_source }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Read settings from Redis
+        id: settings
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          VOICEOVER_PROVIDER: ${{ vars.VOICEOVER_PROVIDER }}
+          SCENE_RENDER_METHOD: ${{ vars.SCENE_RENDER_METHOD }}
+        run: npx tsx .github/scripts/resolve-pipeline-settings.ts >> "$GITHUB_OUTPUT"
+
+  # Step 0: Check Redis queue and populate with AI-generated ideas if empty
+  populate-ideas:
+    name: Populate Ideas Queue
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      added_ideas: ${{ steps.populate.outputs.ideas_added }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check queue and run idea-selector if needed
+        id: populate
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          INIT_PIPELINE: 'true'
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: |
+          npx tsx .github/scripts/check-and-populate-ideas.ts >> $GITHUB_OUTPUT
+
+  # Step 1: Generate video script
+  generate-script:
+    name: Generate Script
+    needs: [populate-ideas, pipeline-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      video_id: ${{ steps.script.outputs.video_id }}
+      video_title: ${{ steps.script.outputs.video_title }}
+      script_data: ${{ steps.script.outputs.script_data }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate script
+        id: script
+        env:
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          SCENE_RENDER_METHOD: ${{ needs.pipeline-settings.outputs.scene_render_method }}
+        run: |
+          FALLBACK_VIDEO_ID="video-$(date +%s)"
+          
+          # Generate script via API or local function
+          # If custom idea provided, use it; otherwise fetch from Redis queue
+          RESPONSE=$(npx tsx .github/scripts/generate-script.ts "${{ github.event.inputs.video_idea }}")
+          COMPACT_RESPONSE=$(echo "$RESPONSE" | jq -c .)
+
+          VIDEO_ID=$(echo "$COMPACT_RESPONSE" | jq -r '.videoId // empty')
+          VIDEO_ID=${VIDEO_ID:-$FALLBACK_VIDEO_ID}
+          VIDEO_TITLE=$(echo "$COMPACT_RESPONSE" | jq -r '.script.title // "Unknown"')
+
+          echo "video_id=$VIDEO_ID" >> "$GITHUB_OUTPUT"
+          echo "video_title=$VIDEO_TITLE" >> "$GITHUB_OUTPUT"
+          {
+            echo "script_data<<SCRIPT_DATA_EOF"
+            echo "$COMPACT_RESPONSE"
+            echo "SCRIPT_DATA_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # Step 2: Render scenes (runs in parallel with voice-over and thumbnail)
+  render-scenes:
+    name: Render Video Scenes
+    needs: [generate-script, pipeline-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      clips_urls: ${{ steps.scenes.outputs.clips_urls }}
+      clips_timings: ${{ steps.scenes.outputs.clips_timings }}
+      animation_stop_times: ${{ steps.scenes.outputs.animation_stop_times }}
+      per_scene_sound_events: ${{ steps.scenes.outputs.per_scene_sound_events }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libxkbcommon0 libxcomposite1 libxrandr2 libgbm1 \
+            libpangocairo-1.0-0 libasound2t64
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Render scenes
+        id: scenes
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          SCENE_RENDER_METHOD: ${{ needs.pipeline-settings.outputs.scene_render_method }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          npx tsx .github/scripts/render-scenes.ts "${{ needs.generate-script.outputs.video_id }}" >> $GITHUB_OUTPUT
+
+  # Step 3: Generate voice-overs (runs in parallel with scene rendering)
+  generate-voiceover:
+    name: Generate Voice-overs
+    needs: [generate-script, pipeline-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      voiceover_data: ${{ steps.voiceover.outputs.voiceover_data }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies (F5 TTS)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -q git+https://github.com/SWivid/F5-TTS.git soundfile librosa torchaudio
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate voice-overs
+        id: voiceover
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          VOICEOVER_PROVIDER: ${{ needs.pipeline-settings.outputs.voiceover_provider }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          npx tsx .github/scripts/generate-voiceover.ts "${{ needs.generate-script.outputs.video_id }}" >> $GITHUB_OUTPUT
+
+  # Step 4: Generate thumbnail (runs in parallel with everything above)
+  generate-thumbnail:
+    name: Generate Thumbnail
+    needs: generate-script
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      thumbnail_url: ${{ steps.thumbnail.outputs.thumbnail_url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install system dependencies (for Puppeteer thumbnail rendering)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libxkbcommon0 libxcomposite1 libxrandr2 libgbm1 \
+            libpangocairo-1.0-0 libasound2t64
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate thumbnail
+        id: thumbnail
+        env:
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          npx tsx .github/scripts/generate-thumbnail.ts "${{ needs.generate-script.outputs.video_id }}" >> $GITHUB_OUTPUT
+
+  # Step 5: Assemble video
+  assemble-video:
+    name: Assemble Video
+    needs: [generate-script, render-scenes, generate-voiceover, pipeline-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      video_url: ${{ steps.assemble.outputs.video_url }}
+      scene_durations: ${{ steps.assemble.outputs.scene_durations }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Assemble video
+        id: assemble
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          CLIPS_URLS: ${{ needs.render-scenes.outputs.clips_urls }}
+          CLIPS_TIMINGS: ${{ needs.render-scenes.outputs.clips_timings }}
+          ANIMATION_STOP_TIMES: ${{ needs.render-scenes.outputs.animation_stop_times }}
+          PER_SCENE_SOUND_EVENTS: ${{ needs.render-scenes.outputs.per_scene_sound_events }}
+          VOICEOVER_URLS: ${{ needs.generate-voiceover.outputs.voiceover_data }}
+          VOICEOVER_PROVIDER: ${{ needs.pipeline-settings.outputs.voiceover_provider }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          RESULT=$(npx tsx .github/scripts/assemble-video.ts "${{ needs.generate-script.outputs.video_id }}")
+          echo "$RESULT" >> $GITHUB_OUTPUT
+
+  # Step 6: Upload to YouTube
+  # Continue even if thumbnail generation fails; upload without thumbnail.
+  upload-youtube:
+    name: Upload to YouTube
+    needs: [generate-script, assemble-video, generate-thumbnail]
+    if: always() && needs.generate-script.result == 'success' && needs.assemble-video.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      youtube_id: ${{ steps.upload.outputs.youtube_id }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Upload to YouTube
+        id: upload
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          THUMBNAIL_URL: ${{ needs.generate-thumbnail.outputs.thumbnail_url }}
+          VIDEO_URL: ${{ needs.assemble-video.outputs.video_url }}
+          SCENE_DURATIONS: ${{ needs.assemble-video.outputs.scene_durations }}
+        run: |
+          RESULT=$(npx tsx .github/scripts/upload-youtube.ts)
+          echo "$RESULT" >> $GITHUB_OUTPUT
+
+  # Determine how many shorts to process and build the matrix indices array
+  shorts-matrix-setup:
+    name: Setup Shorts Matrix
+    needs: [generate-script]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      short_indices: ${{ steps.matrix.outputs.short_indices }}
+
+    steps:
+      - name: Compute short indices from script data
+        id: matrix
+        env:
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+        run: |
+          SHORT_INDICES=$(node -e "
+            const data = JSON.parse(process.env.SCRIPT_DATA);
+            const shorts = (data.script && data.script.shorts) || data.shorts || [];
+            console.log(JSON.stringify(Array.from({length: shorts.length}, (_, i) => i)));
+          ")
+          echo "short_indices=$SHORT_INDICES" >> $GITHUB_OUTPUT
+          echo "📱 Shorts to process: $SHORT_INDICES"
+
+      - name: Initialize shortsProcessing status in Redis
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          SHORT_INDICES: ${{ steps.matrix.outputs.short_indices }}
+        run: |
+          if [ -n "$REDIS_URL" ] && [ "$SHORT_INDICES" != "[]" ]; then
+            npm install --no-save ioredis
+            node -e "
+              const Redis = require('ioredis');
+              const redis = new Redis(process.env.REDIS_URL);
+              redis.hset('pipeline:status:jobs', 'shortsProcessing', 'running')
+                .then(() => redis.expire('pipeline:status:jobs', 604800))
+                .then(() => redis.quit())
+                .catch(err => console.error(err));
+            " || true
+          fi
+
+  # Process each short in parallel — one runner per short
+  # Depends only on generate-script + shorts-matrix-setup so shorts start
+  # immediately after script generation, independently of the long-form pipeline.
+  process-short:
+    name: "Process Short #${{ matrix.short_index }}"
+    needs: [generate-script, shorts-matrix-setup, pipeline-settings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: needs.shorts-matrix-setup.outputs.short_indices != '[]'
+    strategy:
+      fail-fast: false  # one short failing should not cancel siblings
+      matrix:
+        short_index: ${{ fromJson(needs.shorts-matrix-setup.outputs.short_indices) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libxkbcommon0 libxcomposite1 libxrandr2 libgbm1 \
+            libpangocairo-1.0-0 libasound2t64
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies (F5 TTS)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -q git+https://github.com/SWivid/F5-TTS.git soundfile librosa torchaudio
+
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Process short ${{ matrix.short_index }}
+        env:
+          SHORT_INDEX: ${{ matrix.short_index }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          VOICEOVER_PROVIDER: ${{ needs.pipeline-settings.outputs.voiceover_provider }}
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          SCENE_RENDER_METHOD: ${{ needs.pipeline-settings.outputs.scene_render_method }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+        run: |
+          npx tsx .github/scripts/process-single-short.ts "${{ needs.generate-script.outputs.video_id }}"
+
+  # Update shorts job status immediately once parallel shorts complete
+  shorts-status-update:
+    name: Update Shorts Status
+    needs: [generate-script, shorts-matrix-setup, process-short]
+    if: always() && needs.generate-script.result == 'success' && needs.shorts-matrix-setup.outputs.short_indices != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Update shortsProcessing status in Redis
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          SHORTS_RESULT: ${{ needs.process-short.result }}
+        run: |
+          if [ -n "$REDIS_URL" ]; then
+            npm install --no-save ioredis
+            node -e "
+              const Redis = require('ioredis');
+              const redis = new Redis(process.env.REDIS_URL);
+              const status = process.env.SHORTS_RESULT === 'success' ? 'success' : 'failure';
+              redis.hset('pipeline:status:jobs', 'shortsProcessing', status)
+                .then(() => redis.expire('pipeline:status:jobs', 604800))
+                .then(() => {
+                  console.log('✅ Set shortsProcessing in Redis to:', status);
+                  return redis.quit();
+                })
+                .catch(err => {
+                  console.error('⚠️ Could not set shorts status:', err);
+                  process.exit(0);
+                });
+            "
+          fi
+
+  # Step 8: Link Shorts to Long-form Video
+  # Runs after both the long-form video (upload-youtube) and shorts (process-short) finish
+  link-shorts-to-longform:
+    name: Link Shorts to Long-form
+    needs: [generate-script, upload-youtube, process-short]
+    if: always() && needs.generate-script.result == 'success' && needs.upload-youtube.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install system dependencies (for Puppeteer if UI automation runs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libxkbcommon0 libxcomposite1 libxrandr2 libgbm1 \
+            libpangocairo-1.0-0 libasound2t64
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Link Shorts to Long-form Video
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YOUTUBE_STUDIO_COOKIES: ${{ secrets.YOUTUBE_STUDIO_COOKIES }}
+        run: |
+          npx tsx .github/scripts/link-shorts-to-longform.ts "${{ needs.generate-script.outputs.video_id }}" "${{ needs.upload-youtube.outputs.youtube_id }}"
+
+  # Summary job
+  pipeline-summary:
+    name: Pipeline Summary
+    needs: [pipeline-settings, populate-ideas, generate-script, render-scenes, generate-voiceover, assemble-video, upload-youtube, shorts-matrix-setup, process-short, generate-thumbnail, link-shorts-to-longform]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Output summary
+        run: |
+          # Decode hex-encoded URLs
+          VIDEO_URL=$(echo "${{ needs.assemble-video.outputs.video_url }}" | xxd -r -p)
+          THUMBNAIL_URL=$(echo "${{ needs.generate-thumbnail.outputs.thumbnail_url }}" | xxd -r -p)
+          
+          echo "## Video Generation Pipeline Complete 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Video ID:** ${{ needs.generate-script.outputs.video_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📺 YouTube Videos" >> $GITHUB_STEP_SUMMARY
+          echo "**Main Video:** https://youtube.com/watch?v=${{ needs.upload-youtube.outputs.youtube_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Thumbnail:** $THUMBNAIL_URL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎬 Video Assets" >> $GITHUB_STEP_SUMMARY
+          echo "**Assembled Video:** $VIDEO_URL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- Pipeline Settings: ${{ needs.pipeline-settings.outputs.settings_source }} (voiceover: ${{ needs.pipeline-settings.outputs.voiceover_provider }}, render: ${{ needs.pipeline-settings.outputs.scene_render_method }})" >> $GITHUB_STEP_SUMMARY
+          echo "- Populate Ideas: ${{ needs['populate-ideas'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Script Generation: ${{ needs['generate-script'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Scene Rendering: ${{ needs['render-scenes'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Voice-over Generation: ${{ needs['generate-voiceover'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Video Assembly: ${{ needs['assemble-video'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Thumbnail Generation: ${{ needs['generate-thumbnail'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- YouTube Upload: ${{ needs['upload-youtube'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Shorts Matrix Setup: ${{ needs['shorts-matrix-setup'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Shorts Processing (parallel): ${{ needs['process-short'].result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Shorts Linked to Long-form: ${{ needs['link-shorts-to-longform'].result }}" >> $GITHUB_STEP_SUMMARY
+      - name: Send pipeline status to app
+        if: always()
+        env:
+          WEBSITE_DOMAIN: ${{ vars.WEBSITE_DOMAIN }}
+          PIPELINE_WEBHOOK_SECRET: ${{ secrets.PIPELINE_WEBHOOK_SECRET }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SCRIPT_DATA: ${{ needs.generate-script.outputs.script_data }}
+          VIDEO_ID: ${{ needs.generate-script.outputs.video_id }}
+          VIDEO_TITLE: ${{ needs.generate-script.outputs.video_title }}
+          YOUTUBE_ID: ${{ needs.upload-youtube.outputs.youtube_id }}
+          CLIPS_URLS_HEX: ${{ needs.render-scenes.outputs.clips_urls }}
+          VOICEOVER_HEX: ${{ needs.generate-voiceover.outputs.voiceover_data }}
+          VIDEO_URL_HEX: ${{ needs.assemble-video.outputs.video_url }}
+          THUMBNAIL_URL_HEX: ${{ needs.generate-thumbnail.outputs.thumbnail_url }}
+          IDEAS_ADDED: ${{ needs.populate-ideas.outputs.added_ideas }}
+        run: |
+          # Decode hex-encoded asset URLs
+          SCENE_URLS_JSON=$(echo "$CLIPS_URLS_HEX" | xxd -r -p 2>/dev/null || true)
+          SCENE_URLS_JSON=${SCENE_URLS_JSON:-[]}
+          VOICEOVER_URLS_JSON=$(echo "$VOICEOVER_HEX" | xxd -r -p 2>/dev/null || true)
+          VOICEOVER_URLS_JSON=${VOICEOVER_URLS_JSON:-[]}
+          VIDEO_URL=$(echo "$VIDEO_URL_HEX" | xxd -r -p 2>/dev/null || true)
+          VIDEO_URL=${VIDEO_URL:-}
+          THUMBNAIL_URL=$(echo "$THUMBNAIL_URL_HEX" | xxd -r -p 2>/dev/null || true)
+          THUMBNAIL_URL=${THUMBNAIL_URL:-}
+
+          # Ensure VIDEO_ID and VIDEO_TITLE have reliable fallbacks even if script generation failed
+          VIDEO_ID=${VIDEO_ID:-}
+          VIDEO_TITLE=${VIDEO_TITLE:-}
+          if [[ -z "$VIDEO_ID" ]]; then
+            VIDEO_ID="run-${GITHUB_RUN_ID}"
+          fi
+          if [[ -z "$VIDEO_TITLE" ]]; then
+            VIDEO_TITLE="Pipeline Run #${GITHUB_RUN_ID}"
+          fi
+
+          # Extract fields from script_data (env var — safe from quoting/apostrophe issues)
+          DESCRIPTION=$(echo "$SCRIPT_DATA" | jq -r '.script.description // ""' 2>/dev/null || true)
+          DESCRIPTION=${DESCRIPTION:-}
+          SCENE_NARRATIONS=$(echo "$SCRIPT_DATA" | jq -c '[.script.scenes[].narration] // []' 2>/dev/null || true)
+          SCENE_NARRATIONS=${SCENE_NARRATIONS:-[]}
+          SHORT_HOOKS=$(echo "$SCRIPT_DATA" | jq -c '[(.script.shorts // .shorts // [])[].hook // ""]' 2>/dev/null || true)
+          SHORT_HOOKS=${SHORT_HOOKS:-[]}
+          SHORT_CAPTIONS=$(echo "$SCRIPT_DATA" | jq -c '[(.script.shorts // .shorts // [])[] | (.instagramCaption // .caption // "")]' 2>/dev/null || true)
+          SHORT_CAPTIONS=${SHORT_CAPTIONS:-[]}
+          # Keep full raw script for app display/copy
+          RAW_SCRIPT=$(echo "$SCRIPT_DATA" | jq -c '.script // {}' 2>/dev/null || true)
+          RAW_SCRIPT=${RAW_SCRIPT:-\{\}}
+          IDEAS_ADDED=${IDEAS_ADDED:-[]}
+
+          # Determine overall status — fail if any critical job failed
+          CRITICAL_RESULTS=(
+            "${{ needs['populate-ideas'].result }}"
+            "${{ needs['generate-script'].result }}"
+            "${{ needs['render-scenes'].result }}"
+            "${{ needs['generate-voiceover'].result }}"
+            "${{ needs['assemble-video'].result }}"
+            "${{ needs['upload-youtube'].result }}"
+          )
+          OVERALL="success"
+          for r in "${CRITICAL_RESULTS[@]}"; do
+            if [[ "$r" == "failure" ]]; then
+              OVERALL="failure"
+              break
+            fi
+          done
+
+          ERROR_SUMMARY=""
+          if [[ "${{ needs['generate-script'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Script Generation failed"
+          elif [[ "${{ needs['populate-ideas'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Populate Ideas failed"
+          elif [[ "${{ needs['render-scenes'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Scene Rendering failed"
+          elif [[ "${{ needs['generate-voiceover'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Voiceover Generation failed"
+          elif [[ "${{ needs['assemble-video'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Video Assembly failed"
+          elif [[ "${{ needs['generate-thumbnail'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="Thumbnail Generation failed"
+          elif [[ "${{ needs['upload-youtube'].result }}" == "failure" ]]; then
+            ERROR_SUMMARY="YouTube Upload failed"
+          fi
+
+          # Build JSON payload using jq for proper escaping
+          PAYLOAD=$(jq -n \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg overallStatus "$OVERALL" \
+            --arg videoId "$VIDEO_ID" \
+            --arg videoTitle "$VIDEO_TITLE" \
+            --arg youtubeId "$YOUTUBE_ID" \
+            --arg videoUrl "$VIDEO_URL" \
+            --arg thumbnailUrl "$THUMBNAIL_URL" \
+            --arg description "$DESCRIPTION" \
+            --arg errorSummary "$ERROR_SUMMARY" \
+            --argjson sceneUrls "$SCENE_URLS_JSON" \
+            --argjson voiceoverUrls "$VOICEOVER_URLS_JSON" \
+            --argjson sceneNarrations "$SCENE_NARRATIONS" \
+            --argjson shortHooks "$SHORT_HOOKS" \
+            --argjson shortCaptions "$SHORT_CAPTIONS" \
+            --argjson ideasAdded "$IDEAS_ADDED" \
+            --arg populateIdeas   "${{ needs['populate-ideas'].result }}" \
+            --arg generateScript  "${{ needs['generate-script'].result }}" \
+            --arg renderScenes    "${{ needs['render-scenes'].result }}" \
+            --arg generateVoiceover "${{ needs['generate-voiceover'].result }}" \
+            --arg assembleLongForm "${{ needs['assemble-video'].result }}" \
+            --arg generateThumbnail "${{ needs['generate-thumbnail'].result }}" \
+            --arg uploadYoutube   "${{ needs['upload-youtube'].result }}" \
+            --arg shortsProcessing "${{ needs['process-short'].result }}" \
+            --arg linkShorts      "${{ needs['link-shorts-to-longform'].result }}" \
+            --argjson scriptData "$RAW_SCRIPT" \
+            '{
+              runId: $runId,
+              overallStatus: $overallStatus,
+              videoId: $videoId,
+              videoTitle: $videoTitle,
+              youtubeId: $youtubeId,
+              videoUrl: $videoUrl,
+              thumbnailUrl: $thumbnailUrl,
+              description: $description,
+              errorSummary: (if $errorSummary != "" then $errorSummary else null end),
+              sceneUrls: $sceneUrls,
+              voiceoverUrls: $voiceoverUrls,
+              sceneNarrations: $sceneNarrations,
+              shortHooks: $shortHooks,
+              shortCaptions: $shortCaptions,
+              ideasAdded: $ideasAdded,
+              scriptData: $scriptData,
+              jobs: {
+                populateIdeas:    $populateIdeas,
+                generateScript:   $generateScript,
+                renderScenes:     $renderScenes,
+                generateVoiceover: $generateVoiceover,
+                assembleLongForm: $assembleLongForm,
+                generateThumbnail: $generateThumbnail,
+                uploadYoutube:    $uploadYoutube,
+                shortsProcessing: $shortsProcessing,
+                linkShorts:       $linkShorts
+              }
+            }')
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $PIPELINE_WEBHOOK_SECRET" \
+            -d "$PAYLOAD" \
+            "$WEBSITE_DOMAIN/api/pipeline-status")
+
+          echo "Pipeline status webhook → HTTP $HTTP_STATUS"
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "⚠️  Webhook call failed (non-fatal)"
+          fi
+
+      - name: Cleanup old Cloudinary assets
+        if: always()
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          npx tsx scripts/cleanup-cloudinary.ts --execute --keep-hours=48 --active-id="${{ needs.generate-script.outputs.video_id }}" || echo "⚠️ Cloudinary cleanup skipped/failed (non-fatal)"
+

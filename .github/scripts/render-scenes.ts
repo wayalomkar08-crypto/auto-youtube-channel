@@ -1,0 +1,109 @@
+/**
+ * GitHub Actions Script: Render Video Scenes
+ * Called by: parallel-rendering job
+ */
+
+import { renderScenes } from '../../workers/video-scene-renderer/src/index';
+import { validateConfig } from '../../shared/config';
+import { setJobStatus, setMetadata, clearList } from './utils/status-updater';
+
+interface ScriptData {
+    script: {
+        scenes: Array<{
+            id: string;
+            sceneTitle?: string;
+            narration: string;
+            baseDuration: number;
+            holdDuration: number;
+            actions: any[];
+        }>;
+    };
+}
+
+async function renderVideoScenes(videoId: string, scriptData: string) {
+    validateConfig(['cloudinary']);
+    console.error(
+        `🎛️ Scene render setting received: ${process.env.SCENE_RENDER_METHOD || 'default (code)'}`
+    );
+
+    const data: ScriptData = JSON.parse(scriptData);
+    console.error(`🎬 Rendering ${data.script.scenes.length} scenes for video ${videoId}`);
+
+    // return {
+    //     urls: [
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766232798/video-gen/scenes/scene_scene-1.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766232865/video-gen/scenes/scene_scene-2.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766232965/video-gen/scenes/scene_scene-3.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766233065/video-gen/scenes/scene_scene-4.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766233166/video-gen/scenes/scene_scene-5.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766233276/video-gen/scenes/scene_scene-6.mp4',
+    //         'https://res.cloudinary.com/divc1cuwa/video/upload/v1766233369/video-gen/scenes/scene_scene-7.mp4'
+    //     ],
+    //     timings: [40, 40, 60, 60, 60, 65, 55],
+    //     animationStopTimes: [24.5, 21.5, 38, 20.5, 24.5, 25, 20.5],
+    // };
+
+    const result = await renderScenes({
+        scenes: data.script.scenes,
+        isShort: false,
+        videoId,
+    });
+
+    console.error(`✅ Rendered ${result.urls.length} scenes`);
+    return result;
+}
+
+// Main execution
+(async () => {
+    try {
+        const videoId = process.argv[2];
+        const scriptData = process.env.SCRIPT_DATA;
+
+        if (!videoId || !scriptData) {
+            throw new Error('Missing required: videoId (arg) or SCRIPT_DATA (env)');
+        }
+
+        await setJobStatus('renderScenes', 'running');
+        try {
+            await clearList('sceneUrls');
+        } catch (e) {
+            console.error('Non-fatal error clearing sceneUrls:', e);
+        }
+        const result = await renderVideoScenes(videoId, scriptData);
+
+        // Preserve assembly inputs in Redis so a later local/repair assembly can
+        // reuse the exact scene timing and SFX plan without rendering scenes again.
+        try {
+            await setMetadata({
+                renderVideoId: videoId,
+                renderTimings: JSON.stringify(result.timings),
+                animationStopTimes: JSON.stringify(result.animationStopTimes),
+                perSceneSoundEvents: JSON.stringify(result.perSceneSoundEvents ?? []),
+            });
+        } catch (metadataError) {
+            console.error('Non-fatal: could not persist render timing/SFX metadata:', metadataError);
+        }
+
+        await setJobStatus('renderScenes', 'success');
+
+        // Output for GitHub Actions (hex encoded to avoid secret detection patterns)
+        console.error(`[DEBUG] About to output clips_urls with ${result.urls?.length || 0} URLs`);
+        console.log(`clips_urls=${Buffer.from(JSON.stringify(result.urls)).toString('hex')}`);
+        console.error(`[DEBUG] Wrote clips_urls`);
+        console.error(`[DEBUG] About to output clips_timings with ${result.timings?.length || 0} timings`);
+        console.log(`clips_timings=${Buffer.from(JSON.stringify(result.timings)).toString('hex')}`);
+        console.error(`[DEBUG] Wrote clips_timings`);
+        console.error(`[DEBUG] About to output animation_stop_times with ${result.animationStopTimes?.length || 0} times`);
+        console.log(`animation_stop_times=${Buffer.from(JSON.stringify(result.animationStopTimes)).toString('hex')}`);
+        console.error(`[DEBUG] Wrote animation_stop_times`);
+        console.error(`[DEBUG] About to output per_scene_sound_events with ${result.perSceneSoundEvents?.length || 0} scenes`);
+        console.log(`per_scene_sound_events=${Buffer.from(JSON.stringify(result.perSceneSoundEvents ?? [])).toString('hex')}`);
+        console.error(`[DEBUG] Wrote per_scene_sound_events`);
+
+        process.exit(0);
+    } catch (error) {
+        await setJobStatus('renderScenes', 'failure');
+        console.error('❌ Scene rendering failed:', error);
+        process.exit(1);
+    }
+})();
